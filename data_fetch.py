@@ -46,31 +46,52 @@ def _statcast_with_retry(start: str, end: str, max_attempts: int = 5) -> pd.Data
             time.sleep(wait)
 
 
-def _load_season_pa(year: int) -> pd.DataFrame:
-    """Load (or download + cache) one season's plate appearances, without names."""
-    pa_cache = os.path.join(CACHE_DIR, f"statcast_{year}.parquet")
-
-    if os.path.exists(pa_cache):
-        return pd.read_parquet(pa_cache)
-
-    from datetime import date
-    end = min(date(year, 11, 5), date.today()).strftime("%Y-%m-%d")
-    raw = _statcast_with_retry(f"{year}-03-20", end)
-
-    # Filter to completed plate appearances only
+def _process_raw(raw: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Filter raw Statcast to completed PAs and shape it into the app schema."""
     df = raw[raw["events"].isin(PLATE_APPEARANCE_EVENTS)][KEEP_COLS].copy()
-
     # Deduplicate: one row per (game, at-bat). Statcast can return duplicate
     # rows for suspended/replayed games or overlapping date pulls.
     df = df.drop_duplicates(subset=["game_pk", "at_bat_number"])
-
     df = df.dropna(subset=["batter", "pitcher", "events"])
     df["batter"] = df["batter"].astype(int)
     df["pitcher"] = df["pitcher"].astype(int)
     df["game_date"] = pd.to_datetime(df["game_date"])
-    df = df.sort_values(["game_date", "game_pk", "at_bat_number"]).reset_index(drop=True)
     df["on_base"] = df["events"].isin(ON_BASE_EVENTS).astype(int)
     df["season"] = year
+    return df
+
+
+def _load_season_pa(year: int) -> pd.DataFrame:
+    """Load (or download + cache) one season's plate appearances, without names.
+
+    For the in-progress (current-year) season, the cache goes stale as new games
+    are played, so on each load we pull any games newer than the cache and append
+    them — keeping the current season fresh without re-downloading the whole year.
+    """
+    from datetime import date
+    pa_cache = os.path.join(CACHE_DIR, f"statcast_{year}.parquet")
+    today = date.today()
+    season_end = min(date(year, 11, 5), today)
+
+    if os.path.exists(pa_cache):
+        df = pd.read_parquet(pa_cache)
+        if year == today.year:  # in-progress season — top up with newer games
+            last = pd.to_datetime(df["game_date"]).max().date()
+            if last < season_end:
+                try:
+                    raw = _statcast_with_retry(last.strftime("%Y-%m-%d"),
+                                               season_end.strftime("%Y-%m-%d"))
+                    df = pd.concat([df, _process_raw(raw, year)], ignore_index=True)
+                    df = df.drop_duplicates(subset=["game_pk", "at_bat_number"])
+                    df = df.sort_values(["game_date", "game_pk", "at_bat_number"]).reset_index(drop=True)
+                    df.to_parquet(pa_cache)
+                except Exception as e:
+                    print(f"Current-season refresh failed ({e}); using cache through {last}.")
+        return df
+
+    raw = _statcast_with_retry(f"{year}-03-20", season_end.strftime("%Y-%m-%d"))
+    df = _process_raw(raw, year)
+    df = df.sort_values(["game_date", "game_pk", "at_bat_number"]).reset_index(drop=True)
     df.to_parquet(pa_cache)
     return df
 
